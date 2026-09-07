@@ -1,0 +1,1 @@
+{"name":"kinetra-studio","version":"0.1.0","private":true,"type":"module","description":"Zero-dependency WebGPU polygon modeling and animation workspace","scripts":{"test":"node --test tests/kernel.test.js","build":"node build.mjs","start":"python3 -m http.server 8765"},"license":"MIT"}
