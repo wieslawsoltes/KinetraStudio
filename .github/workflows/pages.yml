@@ -1,0 +1,133 @@
+name: Test and deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Validate JavaScript syntax and run kernel tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          for file in src/*.js tests/*.js build.mjs scripts/*.mjs; do
+            node --check "$file"
+          done
+          npm test | tee test-results/kernel-report.txt
+      - name: Build standalone application
+        run: npm run build
+      - name: Install browser test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/kinetra-venv"
+          "$RUNNER_TEMP/kinetra-venv/bin/python" -m pip install playwright==1.57.0
+          "$RUNNER_TEMP/kinetra-venv/bin/python" -m playwright install --with-deps chromium
+      - name: Run browser interaction checks on the WebGL2 fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHON="$RUNNER_TEMP/kinetra-venv/bin/python"
+          CHROMIUM="$($PYTHON -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+          "$PYTHON" tests/browser_check.py --offline --chromium "$CHROMIUM"
+      - name: Prepare downloadable source and Pages assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=zip --output=dist/kinetra-studio-source.zip HEAD
+          node scripts/prepare-pages.mjs
+      - name: Retain validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ github.sha }}
+          path: test-results/
+          retention-days: 30
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    name: Deploy and verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify public source commit and HTML checksum
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+          EXPECTED_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { setTimeout as delay } from 'node:timers/promises';
+          import { appendFile } from 'node:fs/promises';
+          const base = new URL(process.env.PAGE_URL);
+          const expected = process.env.EXPECTED_SHA;
+          let lastError;
+          for (let attempt = 1; attempt <= 18; attempt++) {
+            try {
+              const metadataURL = new URL('build-info.json', base);
+              metadataURL.searchParams.set('verify', expected);
+              const metadataResponse = await fetch(metadataURL, { signal: AbortSignal.timeout(15000), cache: 'no-store' });
+              if (!metadataResponse.ok) throw new Error(`Metadata HTTP ${metadataResponse.status}`);
+              const metadata = await metadataResponse.json();
+              if (metadata.commit !== expected) throw new Error(`Expected ${expected}; received ${metadata.commit}`);
+              const appURL = new URL(base);
+              appURL.searchParams.set('verify', expected);
+              const response = await fetch(appURL, { signal: AbortSignal.timeout(15000), cache: 'no-store' });
+              if (!response.ok) throw new Error(`Application HTTP ${response.status}`);
+              const html = Buffer.from(await response.arrayBuffer());
+              const digest = createHash('sha256').update(html).digest('hex');
+              if (digest !== metadata.indexSha256) throw new Error('Published HTML checksum does not match the build');
+              console.log(`Verified ${base}: ${metadata.indexBytes} bytes, source ${expected}, SHA-256 ${digest}`);
+              await appendFile(process.env.GITHUB_STEP_SUMMARY, `## Kinetra Studio deployed\n\n[Open application](${base})\n\nSource commit: \`${expected}\`\n\nPublished HTML: ${metadata.indexBytes} bytes; SHA-256 \`${digest}\`.\n\nBrowser checks: ${metadata.browserChecksPassed} passed on ${metadata.browserBackend}. This verifies the WebGL2 fallback, not native WebGPU.\n`);
+              process.exit(0);
+            } catch (error) {
+              lastError = error;
+              console.log(`Verification attempt ${attempt}: ${error.message}`);
+              if (attempt < 18) await delay(5000);
+            }
+          }
+          throw lastError;
+          JS
